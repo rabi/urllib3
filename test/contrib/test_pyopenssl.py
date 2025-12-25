@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from unittest import mock
 
@@ -5,7 +7,10 @@ import pytest
 
 try:
     from cryptography import x509
-    from OpenSSL.crypto import FILETYPE_PEM, load_certificate  # type: ignore[import]
+    from OpenSSL.crypto import (  # type: ignore[import-not-found]
+        FILETYPE_PEM,
+        load_certificate,
+    )
 
     from urllib3.contrib.pyopenssl import _dnsname_to_stdlib, get_subj_alt_name
 except ImportError:
@@ -33,8 +38,8 @@ def teardown_module() -> None:
 from ..test_ssl import TestSSL  # noqa: E402, F401
 from ..test_util import TestUtilSSL  # noqa: E402, F401
 from ..with_dummyserver.test_https import (  # noqa: E402, F401
-    TestHTTPS,
-    TestHTTPS_Hostname,
+    TestHTTPS_IPV4SAN,
+    TestHTTPS_IPV6SAN,
     TestHTTPS_TLSv1,
     TestHTTPS_TLSv1_1,
     TestHTTPS_TLSv1_2,

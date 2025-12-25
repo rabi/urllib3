@@ -62,8 +62,34 @@ multi-threaded applications.
 Streaming and I/O
 -----------------
 
-When dealing with large responses it's often better to stream the response
-content.
+When using ``preload_content=True`` (the default setting) the
+response body will be read immediately into memory and the HTTP connection
+will be released back into the pool without manual intervention.
+
+However, when dealing with responses of large or unknown length,
+it's often better to stream the response
+content using ``preload_content=False``. Setting ``preload_content`` to ``False`` means
+that urllib3 will only read from the socket when data is requested.
+
+.. note:: When using ``preload_content=False``, you need to manually release
+    the HTTP connection back to the connection pool so that it can be re-used.
+    To ensure the HTTP connection is in a valid state before being re-used
+    all data should be read off the wire.
+
+    You can call the  :meth:`~response.HTTPResponse.drain_conn` to throw away
+    unread data still on the wire. This call isn't necessary if data has already
+    been completely read from the response.
+
+    After all data is read you can call :meth:`~response.HTTPResponse.release_conn`
+    to release the connection into the pool.
+
+    You can call the :meth:`~response.HTTPResponse.close` to close the connection,
+    but this call doesn’t return the connection to the pool, throws away the unread
+    data on the wire, and leaves the connection in an undefined protocol state.
+    This is desirable if you prefer not reading data from the socket to re-using the
+    HTTP connection.
+
+:meth:`~response.HTTPResponse.stream` lets you iterate over chunks of the response content.
 
 .. code-block:: python
 
@@ -80,14 +106,6 @@ content.
         # b"\x9e\xa97'\x8e\x1eT ....
 
     resp.release_conn()
-
-Setting ``preload_content`` to ``False`` means that urllib3 will stream the
-response content. :meth:`~response.HTTPResponse.stream` lets you iterate over
-chunks of the response content.
-
-.. note:: When using ``preload_content=False``, you should call
-    :meth:`~response.HTTPResponse.release_conn` to release the http connection
-    back to the connection pool so that it can be re-used.
 
 However, you can also treat the :class:`~response.HTTPResponse` instance as
 a file-like object. This allows you to do buffering:
@@ -181,23 +199,23 @@ urllib3's behavior will be different depending on your proxy and destination:
 
 * HTTP proxy + HTTP destination
    Your request will be forwarded with the `absolute URI
-   <https://tools.ietf.org/html/rfc7230#section-5.3.2>`_.
+   <https://datatracker.ietf.org/doc/html/rfc9112#name-absolute-form>`_.
 
 * HTTP proxy + HTTPS destination
     A TCP tunnel will be established with a `HTTP
-    CONNECT <https://tools.ietf.org/html/rfc7231#section-4.3.6>`_. Afterward a
+    CONNECT <https://datatracker.ietf.org/doc/html/rfc9110#name-connect>`_. Afterward a
     TLS connection will be established with the destination and your request
     will be sent.
 
 * HTTPS proxy + HTTP destination
     A TLS connection will be established to the proxy and later your request
     will be forwarded with the `absolute URI
-    <https://tools.ietf.org/html/rfc7230#section-5.3.2>`_.
+    <https://datatracker.ietf.org/doc/html/rfc9112#name-absolute-form>`_.
 
 * HTTPS proxy + HTTPS destination
     A TLS-in-TLS tunnel will be established.  An initial TLS connection will be
     established to the proxy, then an `HTTP CONNECT
-    <https://tools.ietf.org/html/rfc7231#section-4.3.6>`_ will be sent to
+    <https://datatracker.ietf.org/doc/html/rfc9110#name-connect>`_ will be sent to
     establish a TCP connection to the destination and finally a second TLS
     connection will be established to the destination. You can customize the
     :class:`ssl.SSLContext` used for the proxy TLS connection through the
@@ -205,7 +223,7 @@ urllib3's behavior will be different depending on your proxy and destination:
     class.
 
 For HTTPS proxies we also support forwarding your requests to HTTPS destinations with
-an `absolute URI <https://tools.ietf.org/html/rfc7230#section-5.3.2>`_ if the
+an `absolute URI <https://datatracker.ietf.org/doc/html/rfc9112#name-absolute-form>`_ if the
 ``use_forwarding_for_https`` argument is set to ``True``. We strongly recommend you
 **only use this option with trusted or corporate proxies** as the proxy will have
 full visibility of your requests.
@@ -538,9 +556,43 @@ Here's an example using brotli encoding via the ``Accept-Encoding`` header:
         headers={"Accept-Encoding": "br"}
     )
 
+Zstandard Encoding
+------------------
+
+`Zstandard <https://datatracker.ietf.org/doc/html/rfc8878>`_
+is a compression algorithm created by Facebook with better compression
+than brotli, gzip and deflate (see `benchmarks <https://facebook.github.io/zstd/#benchmarks>`_)
+and is supported by urllib3 in Python 3.14+ using the `compression.zstd <https://peps.python.org/pep-0784/>`_ standard library module
+and for Python 3.13 and earlier if the `backports.zstd package <https://pypi.org/project/backports.zstd/>`_ is installed.
+You may also request the package be installed via the ``urllib3[zstd]`` extra:
+
+.. code-block:: bash
+
+    # This is only necessary on Python 3.13 and earlier.
+    # Otherwise zstandard support is included in the Python standard library.
+    $ python -m pip install urllib3[zstd]
+
+.. note::
+
+    Zstandard support in urllib3 requires using v0.18.0 or later of the ``zstandard`` package.
+    If the version installed is less than v0.18.0 then Zstandard support won't be enabled.
+
+Here's an example using zstd encoding via the ``Accept-Encoding`` header:
+
+.. code-block:: python
+
+    import urllib3
+
+    urllib3.request(
+        "GET",
+        "https://www.facebook.com/",
+        headers={"Accept-Encoding": "zstd"}
+    )
+
+
 Decrypting Captured TLS Sessions with Wireshark
 -----------------------------------------------
-Python 3.8 and higher support logging of TLS pre-master secrets.
+Python supports logging of TLS pre-master secrets.
 With these secrets tools like `Wireshark <https://wireshark.org>`_ can decrypt captured
 network traffic.
 
@@ -571,7 +623,7 @@ flag that isn't set by default, and then makes a HTTPS request:
     import ssl
 
     from urllib3 import PoolManager
-    from urllib3.util.ssl_ import create_urllib3_context
+    from urllib3.util import create_urllib3_context
 
     ctx = create_urllib3_context()
     ctx.load_default_certs()

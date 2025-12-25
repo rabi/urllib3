@@ -4,11 +4,14 @@
 # stdlib.   http://docs.python.org/3/license.html
 # It is modified to remove commonName support.
 
+from __future__ import annotations
+
 import ipaddress
 import re
-from typing import TYPE_CHECKING, Any, Match, Optional, Tuple, Union
+import typing
+from ipaddress import IPv4Address, IPv6Address
 
-if TYPE_CHECKING:
+if typing.TYPE_CHECKING:
     from .ssl_ import _TYPE_PEER_CERT_RET_DICT
 
 __version__ = "3.5.0.1"
@@ -19,8 +22,8 @@ class CertificateError(ValueError):
 
 
 def _dnsname_match(
-    dn: Any, hostname: str, max_wildcards: int = 1
-) -> Union[Optional[Match[str]], bool]:
+    dn: typing.Any, hostname: str, max_wildcards: int = 1
+) -> typing.Match[str] | None | bool:
     """Matching according to RFC 6125, section 6.4.3
 
     http://tools.ietf.org/html/rfc6125#section-6.4.3
@@ -74,20 +77,23 @@ def _dnsname_match(
     return pat.match(hostname)
 
 
-def _ipaddress_match(ipname: Any, host_ip: str) -> bool:
+def _ipaddress_match(ipname: str, host_ip: IPv4Address | IPv6Address) -> bool:
     """Exact matching of IP addresses.
 
-    RFC 6125 explicitly doesn't define an algorithm for this
-    (section 1.7.2 - "Out of Scope").
+    RFC 9110 section 4.3.5: "A reference identity of IP-ID contains the decoded
+    bytes of the IP address. An IP version 4 address is 4 octets, and an IP
+    version 6 address is 16 octets. [...] A reference identity of type IP-ID
+    matches if the address is identical to an iPAddress value of the
+    subjectAltName extension of the certificate."
     """
     # OpenSSL may add a trailing newline to a subjectAltName's IP address
     # Divergence from upstream: ipaddress can't handle byte str
     ip = ipaddress.ip_address(ipname.rstrip())
-    return bool(ip == host_ip)
+    return bool(ip.packed == host_ip.packed)
 
 
 def match_hostname(
-    cert: Optional["_TYPE_PEER_CERT_RET_DICT"],
+    cert: _TYPE_PEER_CERT_RET_DICT | None,
     hostname: str,
     hostname_checks_common_name: bool = False,
 ) -> None:
@@ -106,12 +112,20 @@ def match_hostname(
         )
     try:
         # Divergence from upstream: ipaddress can't handle byte str
-        host_ip = ipaddress.ip_address(hostname.strip("[]"))
+        #
+        # The ipaddress module shipped with Python < 3.9 does not support
+        # scoped IPv6 addresses so we unconditionally strip the Zone IDs for
+        # now. Once we drop support for Python 3.9 we can remove this branch.
+        if "%" in hostname:
+            host_ip = ipaddress.ip_address(hostname[: hostname.rfind("%")])
+        else:
+            host_ip = ipaddress.ip_address(hostname)
+
     except ValueError:
         # Not an IP address (common case)
         host_ip = None
     dnsnames = []
-    san: Tuple[Tuple[str, str], ...] = cert.get("subjectAltName", ())
+    san: tuple[tuple[str, str], ...] = cert.get("subjectAltName", ())
     key: str
     value: str
     for key, value in san:
@@ -132,7 +146,7 @@ def match_hostname(
                 if key == "commonName":
                     if _dnsname_match(value, hostname):
                         return
-                    dnsnames.append(value)
+                    dnsnames.append(value)  # Defensive: for Python < 3.9.3
 
     if len(dnsnames) > 1:
         raise CertificateError(

@@ -1,5 +1,8 @@
+from __future__ import annotations
+
+import io
 import socket
-from typing import List, Optional, Union
+import typing
 
 import pytest
 
@@ -11,9 +14,6 @@ from dummyserver.testcase import (
 from urllib3 import HTTPConnectionPool
 from urllib3.util import SKIP_HEADER
 from urllib3.util.retry import Retry
-
-# Retry failed tests
-pytestmark = pytest.mark.flaky
 
 
 class TestChunkedTransfer(SocketDummyServerTestCase):
@@ -43,7 +43,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
             [b"foo", b"bar", b"", b"bazzzzzzzzzzzzzzzzzzzzzz"],
         ],
     )
-    def test_chunks(self, chunks: List[Union[bytes, str]]) -> None:
+    def test_chunks(self, chunks: list[bytes | str]) -> None:
         self.start_chunked_handler()
         with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
             pool.urlopen("GET", "/", body=chunks, headers=dict(DNT="1"), chunked=True)  # type: ignore[arg-type]
@@ -59,15 +59,31 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
                 assert lines[i * 2] == hex(len(chunk))[2:].encode("utf-8")
                 assert lines[i * 2 + 1] == chunk.encode("utf-8")
 
-    def _test_body(self, data: Optional[Union[bytes, str]]) -> None:
+    def _test_body(
+        self,
+        data: (
+            bytes
+            | str
+            | io.BytesIO
+            | io.StringIO
+            | typing.Iterable[bytes]
+            | typing.Iterable[str]
+            | None
+        ),
+        expected_data: bytes | None = None,
+    ) -> None:
         self.start_chunked_handler()
         with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
-            pool.urlopen("GET", "/", data, chunked=True)
+            pool.urlopen("GET", "/", body=data, chunked=True)  # type: ignore[arg-type]
             header, body = self.buffer.split(b"\r\n\r\n", 1)
 
             assert b"Transfer-Encoding: chunked" in header.split(b"\r\n")
             if data:
-                bdata = data if isinstance(data, bytes) else data.encode("utf-8")
+                if expected_data is not None:
+                    bdata = expected_data
+                else:
+                    assert isinstance(data, (bytes, str))
+                    bdata = data if isinstance(data, bytes) else data.encode("utf-8")
                 assert b"\r\n" + bdata + b"\r\n" in body
                 assert body.endswith(b"\r\n0\r\n\r\n")
 
@@ -81,7 +97,48 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
         self._test_body(b"thisshouldbeonechunk\r\nasdf")
 
     def test_unicode_body(self) -> None:
-        self._test_body("thisshouldbeonechunk\r\näöüß")
+        self._test_body(
+            "thisshouldbeonechunk\r\näöüß\xff",
+            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
+        )
+
+    @pytest.mark.parametrize(
+        "bytes_data",
+        [
+            b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",  # utf-8
+            b"thisshouldbeonechunk\r\n\xe4\xf6\xfc\xdf\xff",  # latin-1
+        ],
+    )
+    def test_bytes_body_fileio(self, bytes_data: bytes) -> None:
+        self._test_body(io.BytesIO(bytes_data), expected_data=bytes_data)
+
+    def test_unicode_body_fileio(self) -> None:
+        self._test_body(
+            io.StringIO("thisshouldbeonechunk\r\näöüß\xff"),
+            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
+        )
+
+    @pytest.mark.parametrize(
+        "bytes_data",
+        [
+            b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",  # utf-8
+            b"thisshouldbeonechunk\r\n\xe4\xf6\xfc\xdf\xff",  # latin-1
+        ],
+    )
+    def test_bytes_body_iterable(self, bytes_data: bytes) -> None:
+        def send_body() -> typing.Iterable[bytes]:
+            yield bytes_data
+
+        self._test_body(send_body(), expected_data=bytes_data)
+
+    def test_unicode_body_iterable(self) -> None:
+        def send_body() -> typing.Iterable[str]:
+            yield "thisshouldbeonechunk\r\näöüß\xff"
+
+        self._test_body(
+            send_body(),
+            expected_data=b"thisshouldbeonechunk\r\n\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f\xc3\xbf",
+        )
 
     def test_empty_body(self) -> None:
         self._test_body(None)
@@ -92,7 +149,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
     def test_empty_iterable_body(self) -> None:
         self._test_body(None)
 
-    def _get_header_lines(self, prefix: bytes) -> List[bytes]:
+    def _get_header_lines(self, prefix: bytes) -> list[bytes]:
         header_block = self.buffer.split(b"\r\n\r\n", 1)[0].lower()
         header_lines = header_block.split(b"\r\n")[1:]
         return [x for x in header_lines if x.startswith(prefix)]
@@ -190,7 +247,7 @@ class TestChunkedTransfer(SocketDummyServerTestCase):
 
     def test_preserve_chunked_on_retry_after(self) -> None:
         self.chunked_requests = 0
-        self.socks: List[socket.socket] = []
+        self.socks: list[socket.socket] = []
 
         def socket_handler(listener: socket.socket) -> None:
             for _ in range(2):

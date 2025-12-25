@@ -7,47 +7,18 @@ benefits from this library.
 Your contribution will go towards adding new features to urllib3 and making
 sure all functionality continues to meet our high quality standards.
 
+All expenses and contributions can be `tracked on our Open Collective page
+<https://opencollective.com/urllib3>`__. We also write annual reports:
 
-v2.0 Sponsor Perks
-------------------
+* 2019: https://sethmlarson.dev/review-of-2019-for-urllib3
+* 2020: https://sethmlarson.dev/urllib3-in-2020
+* 2021: https://sethmlarson.dev/urllib3-raised-15k-in-2021
+* 2022: https://sethmlarson.dev/urllib3-in-2022
+* 2023: https://sethmlarson.dev/urllib3-is-fundraising-for-http2-support
+* 2024: https://quentin.pradet.me/blog/urllib3-in-2024.html
 
-.. important::
-
-   `Get in contact <mailto:sethmichaellarson@gmail.com>`_ for additional
-   details on sponsorship and perks before making a contribution
-   through `GitHub Sponsors <https://github.com/sponsors/urllib3>`_ if you have questions.
-
-
-Silver v2.0 Sponsor Perks
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-- Your organization name and URL permanently added
-  to the **Sponsors and Grants** section below
-- Thank you within the v2.0 release announcement
-  and on Twitter from urllib3 maintainers
-
-➤ `Contribute to the "Silver v2.0 Sponsor" tier <https://opencollective.com/urllib3/contribute/silver-v2-sponsor-20442/checkout>`_
-on Open Collective.
-
-
-Gold v2.0 Sponsor Perks
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-- Organization logo and URL listed on top of the v2.0 Roadmap
-- Call with one or more urllib3 maintainer(s) to discuss
-  the v2.0 release and how it impacts your organization
-- Your organization will be thanked within the v2.0 release
-  announcement, within all blog posts and public updates related to v2.0
-  development, and multiple thank-you's on Twitter from
-  urllib3 maintainers throughout v2.0 development
-- All perks from the **Silver v2.0 Sponsors Perks** above
-
-➤ `Contribute to the "Gold v2.0 Sponsor" tier <https://opencollective.com/urllib3/contribute/gold-v2-sponsor-20443/checkout>`_
-on Open Collective.
-
-
-Sponsors and Grants
--------------------
+Sponsors and Grants (prior to 2019)
+-----------------------------------
 
 A grant for contiguous full-time development has the biggest impact for
 progress. Periods of 3 to 10 days allow a contributor to tackle substantial
@@ -60,6 +31,8 @@ to arrange a grant for a core contributor.
 We also welcome sponsorship in the form of time. We greatly appreciate companies
 who encourage employees to contribute on an ongoing basis during their work hours.
 Let us know and we'll be glad to add you to our sponsors list.
+
+* `Spotify <https://engineering.atspotify.com/opensource/>`_ (June 2nd, 2022)
 
 * `GitCoin Grants <https://gitcoin.co/grants>`_ (2019-2020), sponsored `@sethmlarson <https://github.com/sethmlarson>`_
   and `@pquentin <https://github.com/pquentin>`_

@@ -1,12 +1,8 @@
 [run]
 source =
     urllib3
-
-omit =
-    *urllib3/packages/*
-    *urllib3/contrib/pyopenssl.py
-    *urllib3/contrib/securetransport.py
-    *urllib3/contrib/_securetransport/*
+# Needed for Python 3.11 and lower
+disable_warnings = no-sysmon
 
 [paths]
 source =
@@ -15,7 +11,13 @@ source =
     *\urllib3
 
 [report]
+omit =
+    src/urllib3/contrib/pyopenssl.py
+    src/urllib3/contrib/securetransport.py
+    src/urllib3/contrib/_securetransport/*
+
 exclude_lines =
+    except ModuleNotFoundError:
     except ImportError:
     pass
     import
@@ -24,5 +26,5 @@ exclude_lines =
     .*:.* # Python \d.*
     .* # Abstract
     .* # Defensive:
-    if TYPE_CHECKING:
+    if (?:typing.)?TYPE_CHECKING:
     ^\s*?\.\.\.\s*$

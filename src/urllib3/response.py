@@ -1,37 +1,38 @@
+from __future__ import annotations
+
+import collections
 import io
 import json as _json
 import logging
+import socket
+import sys
+import typing
+import warnings
 import zlib
 from contextlib import contextmanager
 from http.client import HTTPMessage as _HttplibHTTPMessage
 from http.client import HTTPResponse as _HttplibHTTPResponse
 from socket import timeout as SocketTimeout
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Generator,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Tuple,
-    Type,
-    Union,
-)
+
+if typing.TYPE_CHECKING:
+    from ._base_connection import BaseHTTPConnection
 
 try:
     try:
-        import brotlicffi as brotli  # type: ignore[import]
+        import brotlicffi as brotli  # type: ignore[import-not-found]
     except ImportError:
-        import brotli  # type: ignore[import]
+        import brotli  # type: ignore[import-not-found]
 except ImportError:
     brotli = None
 
+from . import util
+from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
-from .connection import _TYPE_BODY, BaseSSLError, HTTPConnection, HTTPException
+from .connection import BaseSSLError, HTTPConnection, HTTPException
 from .exceptions import (
     BodyNotHttplibCompatible,
     DecodeError,
+    DependencyWarning,
     HTTPError,
     IncompleteRead,
     InvalidChunkLength,
@@ -44,16 +45,18 @@ from .exceptions import (
 from .util.response import is_fp_closed, is_response_to_head
 from .util.retry import Retry
 
-if TYPE_CHECKING:
-    from typing_extensions import Literal
-
+if typing.TYPE_CHECKING:
     from .connectionpool import HTTPConnectionPool
 
 log = logging.getLogger(__name__)
 
 
 class ContentDecoder:
-    def decompress(self, data: bytes) -> bytes:
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        raise NotImplementedError()
+
+    @property
+    def has_unconsumed_tail(self) -> bool:
         raise NotImplementedError()
 
     def flush(self) -> bytes:
@@ -63,37 +66,63 @@ class ContentDecoder:
 class DeflateDecoder(ContentDecoder):
     def __init__(self) -> None:
         self._first_try = True
-        self._data = b""
+        self._first_try_data = b""
+        self._unfed_data = b""
         self._obj = zlib.decompressobj()
 
-    def decompress(self, data: bytes) -> bytes:
-        if not data:
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        data = self._unfed_data + data
+        self._unfed_data = b""
+        if not data and not self._obj.unconsumed_tail:
             return data
+        original_max_length = max_length
+        if original_max_length < 0:
+            max_length = 0
+        elif original_max_length == 0:
+            # We should not pass 0 to the zlib decompressor because 0 is
+            # the default value that will make zlib decompress without a
+            # length limit.
+            # Data should be stored for subsequent calls.
+            self._unfed_data = data
+            return b""
 
+        # Subsequent calls always reuse `self._obj`. zlib requires
+        # passing the unconsumed tail if decompression is to continue.
         if not self._first_try:
-            return self._obj.decompress(data)
+            return self._obj.decompress(
+                self._obj.unconsumed_tail + data, max_length=max_length
+            )
 
-        self._data += data
+        # First call tries with RFC 1950 ZLIB format.
+        self._first_try_data += data
         try:
-            decompressed = self._obj.decompress(data)
+            decompressed = self._obj.decompress(data, max_length=max_length)
             if decompressed:
                 self._first_try = False
-                self._data = None  # type: ignore[assignment]
+                self._first_try_data = b""
             return decompressed
+        # On failure, it falls back to RFC 1951 DEFLATE format.
         except zlib.error:
             self._first_try = False
             self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
             try:
-                return self.decompress(self._data)
+                return self.decompress(
+                    self._first_try_data, max_length=original_max_length
+                )
             finally:
-                self._data = None  # type: ignore[assignment]
+                self._first_try_data = b""
+
+    @property
+    def has_unconsumed_tail(self) -> bool:
+        return bool(self._unfed_data) or (
+            bool(self._obj.unconsumed_tail) and not self._first_try
+        )
 
     def flush(self) -> bytes:
         return self._obj.flush()
 
 
 class GzipDecoderState:
-
     FIRST_MEMBER = 0
     OTHER_MEMBERS = 1
     SWALLOW_DATA = 2
@@ -103,27 +132,61 @@ class GzipDecoder(ContentDecoder):
     def __init__(self) -> None:
         self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
         self._state = GzipDecoderState.FIRST_MEMBER
+        self._unconsumed_tail = b""
 
-    def decompress(self, data: bytes) -> bytes:
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
         ret = bytearray()
-        if self._state == GzipDecoderState.SWALLOW_DATA or not data:
+        if self._state == GzipDecoderState.SWALLOW_DATA:
             return bytes(ret)
+
+        if max_length == 0:
+            # We should not pass 0 to the zlib decompressor because 0 is
+            # the default value that will make zlib decompress without a
+            # length limit.
+            # Data should be stored for subsequent calls.
+            self._unconsumed_tail += data
+            return b""
+
+        # zlib requires passing the unconsumed tail to the subsequent
+        # call if decompression is to continue.
+        data = self._unconsumed_tail + data
+        if not data and self._obj.eof:
+            return bytes(ret)
+
         while True:
             try:
-                ret += self._obj.decompress(data)
+                ret += self._obj.decompress(
+                    data, max_length=max(max_length - len(ret), 0)
+                )
             except zlib.error:
                 previous_state = self._state
                 # Ignore data after the first error
                 self._state = GzipDecoderState.SWALLOW_DATA
+                self._unconsumed_tail = b""
                 if previous_state == GzipDecoderState.OTHER_MEMBERS:
                     # Allow trailing garbage acceptable in other gzip clients
                     return bytes(ret)
                 raise
-            data = self._obj.unused_data
+
+            self._unconsumed_tail = data = (
+                self._obj.unconsumed_tail or self._obj.unused_data
+            )
+            if max_length > 0 and len(ret) >= max_length:
+                break
+
             if not data:
                 return bytes(ret)
-            self._state = GzipDecoderState.OTHER_MEMBERS
-            self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            # When the end of a gzip member is reached, a new decompressor
+            # must be created for unused (possibly future) data.
+            if self._obj.eof:
+                self._state = GzipDecoderState.OTHER_MEMBERS
+                self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+
+        return bytes(ret)
+
+    @property
+    def has_unconsumed_tail(self) -> bool:
+        return bool(self._unconsumed_tail)
 
     def flush(self) -> bytes:
         return self._obj.flush()
@@ -138,13 +201,99 @@ if brotli is not None:
         def __init__(self) -> None:
             self._obj = brotli.Decompressor()
             if hasattr(self._obj, "decompress"):
-                setattr(self, "decompress", self._obj.decompress)
+                setattr(self, "_decompress", self._obj.decompress)
             else:
-                setattr(self, "decompress", self._obj.process)
+                setattr(self, "_decompress", self._obj.process)
+
+        # Requires Brotli >= 1.2.0 for `output_buffer_limit`.
+        def _decompress(self, data: bytes, output_buffer_limit: int = -1) -> bytes:
+            raise NotImplementedError()
+
+        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+            try:
+                if max_length > 0:
+                    return self._decompress(data, output_buffer_limit=max_length)
+                else:
+                    return self._decompress(data)
+            except TypeError:
+                # Fallback for Brotli/brotlicffi/brotlipy versions without
+                # the `output_buffer_limit` parameter.
+                warnings.warn(
+                    "Brotli >= 1.2.0 is required to prevent decompression bombs.",
+                    DependencyWarning,
+                )
+                return self._decompress(data)
+
+        @property
+        def has_unconsumed_tail(self) -> bool:
+            try:
+                return not self._obj.can_accept_more_data()
+            except AttributeError:
+                return False
 
         def flush(self) -> bytes:
             if hasattr(self._obj, "flush"):
                 return self._obj.flush()  # type: ignore[no-any-return]
+            return b""
+
+
+try:
+    if sys.version_info >= (3, 14):
+        from compression import zstd
+    else:
+        from backports import zstd
+except ImportError:
+    HAS_ZSTD = False
+else:
+    HAS_ZSTD = True
+
+    class ZstdDecoder(ContentDecoder):
+        def __init__(self) -> None:
+            self._obj = zstd.ZstdDecompressor()
+
+        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+            if not data and not self.has_unconsumed_tail:
+                return b""
+            if self._obj.eof:
+                data = self._obj.unused_data + data
+                self._obj = zstd.ZstdDecompressor()
+            part = self._obj.decompress(data, max_length=max_length)
+            length = len(part)
+            data_parts = [part]
+            # Every loop iteration is supposed to read data from a separate frame.
+            # The loop breaks when:
+            #   - enough data is read;
+            #   - no more unused data is available;
+            #   - end of the last read frame has not been reached (i.e.,
+            #     more data has to be fed).
+            while (
+                self._obj.eof
+                and self._obj.unused_data
+                and (max_length < 0 or length < max_length)
+            ):
+                unused_data = self._obj.unused_data
+                if not self._obj.needs_input:
+                    self._obj = zstd.ZstdDecompressor()
+                part = self._obj.decompress(
+                    unused_data,
+                    max_length=(max_length - length) if max_length > 0 else -1,
+                )
+                if part_length := len(part):
+                    data_parts.append(part)
+                    length += part_length
+                elif self._obj.needs_input:
+                    break
+            return b"".join(data_parts)
+
+        @property
+        def has_unconsumed_tail(self) -> bool:
+            return not (self._obj.needs_input or self._obj.eof) or bool(
+                self._obj.unused_data
+            )
+
+        def flush(self) -> bytes:
+            if not self._obj.eof:
+                raise DecodeError("Zstandard data is incomplete")
             return b""
 
 
@@ -157,51 +306,174 @@ class MultiDecoder(ContentDecoder):
         they were applied.
     """
 
+    # Maximum allowed number of chained HTTP encodings in the
+    # Content-Encoding header.
+    max_decode_links = 5
+
     def __init__(self, modes: str) -> None:
-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
+        encodings = [m.strip() for m in modes.split(",")]
+        if len(encodings) > self.max_decode_links:
+            raise DecodeError(
+                "Too many content encodings in the chain: "
+                f"{len(encodings)} > {self.max_decode_links}"
+            )
+        self._decoders = [_get_decoder(e) for e in encodings]
 
     def flush(self) -> bytes:
         return self._decoders[0].flush()
 
-    def decompress(self, data: bytes) -> bytes:
-        for d in reversed(self._decoders):
-            data = d.decompress(data)
-        return data
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if max_length <= 0:
+            for d in reversed(self._decoders):
+                data = d.decompress(data)
+            return data
+
+        ret = bytearray()
+        # Every while loop iteration goes through all decoders once.
+        # It exits when enough data is read or no more data can be read.
+        # It is possible that the while loop iteration does not produce
+        # any data because we retrieve up to `max_length` from every
+        # decoder, and the amount of bytes may be insufficient for the
+        # next decoder to produce enough/any output.
+        while True:
+            any_data = False
+            for d in reversed(self._decoders):
+                data = d.decompress(data, max_length=max_length - len(ret))
+                if data:
+                    any_data = True
+                # We should not break when no data is returned because
+                # next decoders may produce data even with empty input.
+            ret += data
+            if not any_data or len(ret) >= max_length:
+                return bytes(ret)
+            data = b""
+
+    @property
+    def has_unconsumed_tail(self) -> bool:
+        return any(d.has_unconsumed_tail for d in self._decoders)
 
 
 def _get_decoder(mode: str) -> ContentDecoder:
     if "," in mode:
         return MultiDecoder(mode)
 
-    if mode == "gzip":
+    # According to RFC 9110 section 8.4.1.3, recipients should
+    # consider x-gzip equivalent to gzip
+    if mode in ("gzip", "x-gzip"):
         return GzipDecoder()
 
     if brotli is not None and mode == "br":
         return BrotliDecoder()
 
+    if HAS_ZSTD and mode == "zstd":
+        return ZstdDecoder()
+
     return DeflateDecoder()
 
 
+class BytesQueueBuffer:
+    """Memory-efficient bytes buffer
+
+    To return decoded data in read() and still follow the BufferedIOBase API, we need a
+    buffer to always return the correct amount of bytes.
+
+    This buffer should be filled using calls to put()
+
+    Our maximum memory usage is determined by the sum of the size of:
+
+     * self.buffer, which contains the full data
+     * the largest chunk that we will copy in get()
+    """
+
+    def __init__(self) -> None:
+        self.buffer: typing.Deque[bytes | memoryview[bytes]] = collections.deque()
+        self._size: int = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def put(self, data: bytes) -> None:
+        self.buffer.append(data)
+        self._size += len(data)
+
+    def get(self, n: int) -> bytes:
+        if n == 0:
+            return b""
+        elif not self.buffer:
+            raise RuntimeError("buffer is empty")
+        elif n < 0:
+            raise ValueError("n should be > 0")
+
+        if len(self.buffer[0]) == n and isinstance(self.buffer[0], bytes):
+            self._size -= n
+            return self.buffer.popleft()
+
+        fetched = 0
+        ret = io.BytesIO()
+        while fetched < n:
+            remaining = n - fetched
+            chunk = self.buffer.popleft()
+            chunk_length = len(chunk)
+            if remaining < chunk_length:
+                chunk = memoryview(chunk)
+                left_chunk, right_chunk = chunk[:remaining], chunk[remaining:]
+                ret.write(left_chunk)
+                self.buffer.appendleft(right_chunk)
+                self._size -= remaining
+                break
+            else:
+                ret.write(chunk)
+                self._size -= chunk_length
+            fetched += chunk_length
+
+            if not self.buffer:
+                break
+
+        return ret.getvalue()
+
+    def get_all(self) -> bytes:
+        buffer = self.buffer
+        if not buffer:
+            assert self._size == 0
+            return b""
+        if len(buffer) == 1:
+            result = buffer.pop()
+            if isinstance(result, memoryview):
+                result = result.tobytes()
+        else:
+            ret = io.BytesIO()
+            ret.writelines(buffer.popleft() for _ in range(len(buffer)))
+            result = ret.getvalue()
+        self._size = 0
+        return result
+
+
 class BaseHTTPResponse(io.IOBase):
-    CONTENT_DECODERS = ["gzip", "deflate"]
+    CONTENT_DECODERS = ["gzip", "x-gzip", "deflate"]
     if brotli is not None:
         CONTENT_DECODERS += ["br"]
+    if HAS_ZSTD:
+        CONTENT_DECODERS += ["zstd"]
     REDIRECT_STATUSES = [301, 302, 303, 307, 308]
 
-    DECODER_ERROR_CLASSES: Tuple[Type[Exception], ...] = (IOError, zlib.error)
+    DECODER_ERROR_CLASSES: tuple[type[Exception], ...] = (IOError, zlib.error)
     if brotli is not None:
         DECODER_ERROR_CLASSES += (brotli.error,)
+
+    if HAS_ZSTD:
+        DECODER_ERROR_CLASSES += (zstd.ZstdError,)
 
     def __init__(
         self,
         *,
-        headers: Optional[Union[Mapping[str, str], Mapping[bytes, bytes]]] = None,
+        headers: typing.Mapping[str, str] | typing.Mapping[bytes, bytes] | None = None,
         status: int,
         version: int,
-        reason: Optional[str],
+        version_string: str,
+        reason: str | None,
         decode_content: bool,
-        request_url: Optional[str],
-        retries: Optional[Retry] = None,
+        request_url: str | None,
+        retries: Retry | None = None,
     ) -> None:
         if isinstance(headers, HTTPHeaderDict):
             self.headers = headers
@@ -209,9 +481,11 @@ class BaseHTTPResponse(io.IOBase):
             self.headers = HTTPHeaderDict(headers)  # type: ignore[arg-type]
         self.status = status
         self.version = version
+        self.version_string = version_string
         self.reason = reason
         self.decode_content = decode_content
-        self.request_url: Optional[str]
+        self._has_decoded_content = False
+        self._request_url: str | None = request_url
         self.retries = retries
 
         self.chunked = False
@@ -221,9 +495,10 @@ class BaseHTTPResponse(io.IOBase):
         if "chunked" in encodings:
             self.chunked = True
 
-        self._decoder: Optional[ContentDecoder] = None
+        self._decoder: ContentDecoder | None = None
+        self.length_remaining: int | None
 
-    def get_redirect_location(self) -> Union[Optional[str], "Literal[False]"]:
+    def get_redirect_location(self) -> str | None | typing.Literal[False]:
         """
         Should we redirect and where to?
 
@@ -239,55 +514,84 @@ class BaseHTTPResponse(io.IOBase):
     def data(self) -> bytes:
         raise NotImplementedError()
 
-    def json(self) -> Any:
+    def json(self) -> typing.Any:
         """
-        Parses the body of the HTTP response as JSON.
+        Deserializes the body of the HTTP response as a Python object.
 
-        To use a custom JSON decoder pass the result of :attr:`HTTPResponse.data` to the decoder.
+        The body of the HTTP response must be encoded using UTF-8, as per
+        `RFC 8529 Section 8.1 <https://www.rfc-editor.org/rfc/rfc8259#section-8.1>`_.
 
-        This method can raise either `UnicodeDecodeError` or `json.JSONDecodeError`.
+        To use a custom JSON decoder pass the result of :attr:`HTTPResponse.data` to
+        your custom decoder instead.
 
-        Read more :ref:`here <json>`.
+        If the body of the HTTP response is not decodable to UTF-8, a
+        `UnicodeDecodeError` will be raised. If the body of the HTTP response is not a
+        valid JSON document, a `json.JSONDecodeError` will be raised.
+
+        Read more :ref:`here <json_content>`.
+
+        :returns: The body of the HTTP response as a Python object.
         """
         data = self.data.decode("utf-8")
         return _json.loads(data)
 
     @property
-    def url(self) -> Optional[str]:
+    def url(self) -> str | None:
+        raise NotImplementedError()
+
+    @url.setter
+    def url(self, url: str | None) -> None:
         raise NotImplementedError()
 
     @property
-    def closed(self) -> bool:
+    def connection(self) -> BaseHTTPConnection | None:
         raise NotImplementedError()
 
     @property
-    def connection(self) -> Optional[HTTPConnection]:
-        raise NotImplementedError()
+    def retries(self) -> Retry | None:
+        return self._retries
+
+    @retries.setter
+    def retries(self, retries: Retry | None) -> None:
+        # Override the request_url if retries has a redirect location.
+        if retries is not None and retries.history:
+            self.url = retries.history[-1].redirect_location
+        self._retries = retries
 
     def stream(
-        self, amt: Optional[int] = 2 ** 16, decode_content: Optional[bool] = None
-    ) -> Iterator[bytes]:
+        self, amt: int | None = 2**16, decode_content: bool | None = None
+    ) -> typing.Iterator[bytes]:
         raise NotImplementedError()
 
     def read(
         self,
-        amt: Optional[int] = None,
-        decode_content: Optional[bool] = None,
+        amt: int | None = None,
+        decode_content: bool | None = None,
         cache_content: bool = False,
+    ) -> bytes:
+        raise NotImplementedError()
+
+    def read1(
+        self,
+        amt: int | None = None,
+        decode_content: bool | None = None,
     ) -> bytes:
         raise NotImplementedError()
 
     def read_chunked(
         self,
-        amt: Optional[int] = None,
-        decode_content: Optional[bool] = None,
-    ) -> Iterator[bytes]:
+        amt: int | None = None,
+        decode_content: bool | None = None,
+    ) -> typing.Iterator[bytes]:
         raise NotImplementedError()
 
     def release_conn(self) -> None:
         raise NotImplementedError()
 
     def drain_conn(self) -> None:
+        raise NotImplementedError()
+
+    def shutdown(self) -> None:
         raise NotImplementedError()
 
     def close(self) -> None:
@@ -313,17 +617,30 @@ class BaseHTTPResponse(io.IOBase):
                     self._decoder = _get_decoder(content_encoding)
 
     def _decode(
-        self, data: bytes, decode_content: Optional[bool], flush_decoder: bool
+        self,
+        data: bytes,
+        decode_content: bool | None,
+        flush_decoder: bool,
+        max_length: int | None = None,
     ) -> bytes:
         """
         Decode the data passed in and potentially flush the decoder.
         """
         if not decode_content:
+            if self._has_decoded_content:
+                raise RuntimeError(
+                    "Calling read(decode_content=False) is not supported after "
+                    "read(decode_content=True) was called."
+                )
             return data
+
+        if max_length is None or flush_decoder:
+            max_length = -1
 
         try:
             if self._decoder:
-                data = self._decoder.decompress(data)
+                data = self._decoder.decompress(data, max_length=max_length)
+                self._has_decoded_content = True
         except self.DECODER_ERROR_CLASSES as e:
             content_encoding = self.headers.get("content-encoding", "").lower()
             raise DecodeError(
@@ -346,9 +663,6 @@ class BaseHTTPResponse(io.IOBase):
         return b""
 
     # Compatibility methods for `io` module
-    def readable(self) -> bool:
-        return True
-
     def readinto(self, b: bytearray) -> int:
         temp = self.read(len(b))
         if len(temp) == 0:
@@ -357,18 +671,18 @@ class BaseHTTPResponse(io.IOBase):
             b[: len(temp)] = temp
             return len(temp)
 
-    # Compatibility methods for http.client.HTTPResponse
-    def getheaders(self) -> List[Tuple[str, str]]:
-        return list(self.headers.items())
+    # Methods used by dependent libraries
+    def getheaders(self) -> HTTPHeaderDict:
+        return self.headers
 
-    def getheader(self, name: str, default: Optional[str] = None) -> Optional[str]:
+    def getheader(self, name: str, default: str | None = None) -> str | None:
         return self.headers.get(name, default)
 
     # Compatibility method for http.cookiejar
     def info(self) -> HTTPHeaderDict:
         return self.headers
 
-    def geturl(self) -> Optional[Union[str, "Literal[False]"]]:
+    def geturl(self) -> str | None:
         return self.url
 
 
@@ -408,26 +722,29 @@ class HTTPResponse(BaseHTTPResponse):
     def __init__(
         self,
         body: _TYPE_BODY = "",
-        headers: Optional[Union[Mapping[str, str], Mapping[bytes, bytes]]] = None,
+        headers: typing.Mapping[str, str] | typing.Mapping[bytes, bytes] | None = None,
         status: int = 0,
         version: int = 0,
-        reason: Optional[str] = None,
+        version_string: str = "HTTP/?",
+        reason: str | None = None,
         preload_content: bool = True,
         decode_content: bool = True,
-        original_response: Optional[_HttplibHTTPResponse] = None,
-        pool: Optional["HTTPConnectionPool"] = None,
-        connection: Optional[HTTPConnection] = None,
-        msg: Optional[_HttplibHTTPMessage] = None,
-        retries: Optional[Retry] = None,
+        original_response: _HttplibHTTPResponse | None = None,
+        pool: HTTPConnectionPool | None = None,
+        connection: HTTPConnection | None = None,
+        msg: _HttplibHTTPMessage | None = None,
+        retries: Retry | None = None,
         enforce_content_length: bool = True,
-        request_method: Optional[str] = None,
-        request_url: Optional[str] = None,
+        request_method: str | None = None,
+        request_url: str | None = None,
         auto_close: bool = True,
+        sock_shutdown: typing.Callable[[int], None] | None = None,
     ) -> None:
         super().__init__(
             headers=headers,
             status=status,
             version=version,
+            version_string=version_string,
             reason=reason,
             decode_content=decode_content,
             request_url=request_url,
@@ -438,14 +755,10 @@ class HTTPResponse(BaseHTTPResponse):
         self.auto_close = auto_close
 
         self._body = None
-        self._fp: Optional[_HttplibHTTPResponse] = None
+        self._fp: _HttplibHTTPResponse | None = None
         self._original_response = original_response
         self._fp_bytes_read = 0
         self.msg = msg
-        if self.retries is not None and self.retries.history:
-            self._request_url = self.retries.history[-1].redirect_location
-        else:
-            self._request_url = request_url
 
         if body and isinstance(body, (str, bytes)):
             self._body = body
@@ -455,12 +768,16 @@ class HTTPResponse(BaseHTTPResponse):
 
         if hasattr(body, "read"):
             self._fp = body  # type: ignore[assignment]
+        self._sock_shutdown = sock_shutdown
 
         # Are we using the chunked-style of transfer encoding?
-        self.chunk_left: Optional[int] = None
+        self.chunk_left: int | None = None
 
         # Determine length of response
         self.length_remaining = self._init_length(request_method)
+
+        # Used to return the correct amount of bytes for partial read()s
+        self._decoded_buffer = BytesQueueBuffer()
 
         # If requested, preload the body.
         if preload_content and not self._body:
@@ -496,7 +813,7 @@ class HTTPResponse(BaseHTTPResponse):
         return None  # type: ignore[return-value]
 
     @property
-    def connection(self) -> Optional[HTTPConnection]:
+    def connection(self) -> HTTPConnection | None:
         return self._connection
 
     def isclosed(self) -> bool:
@@ -510,12 +827,12 @@ class HTTPResponse(BaseHTTPResponse):
         """
         return self._fp_bytes_read
 
-    def _init_length(self, request_method: Optional[str]) -> Optional[int]:
+    def _init_length(self, request_method: str | None) -> int | None:
         """
         Set initial length value for Response content if available.
         """
-        length: Optional[int]
-        content_length: Optional[str] = self.headers.get("content-length")
+        length: int | None
+        content_length: str | None = self.headers.get("content-length")
 
         if content_length is not None:
             if self.chunked:
@@ -567,7 +884,7 @@ class HTTPResponse(BaseHTTPResponse):
         return length
 
     @contextmanager
-    def _error_catcher(self) -> Generator[None, None, None]:
+    def _error_catcher(self) -> typing.Generator[None]:
         """
         Catch low-level python exceptions, instead re-raising urllib3
         variants, so that low-level exceptions are not leaked in the
@@ -594,8 +911,18 @@ class HTTPResponse(BaseHTTPResponse):
 
                 raise ReadTimeoutError(self._pool, None, "Read timed out.") from e  # type: ignore[arg-type]
 
+            except IncompleteRead as e:
+                if (
+                    e.expected is not None
+                    and e.partial is not None
+                    and e.expected == -e.partial
+                ):
+                    arg = "Response may not contain content."
+                else:
+                    arg = f"Connection broken: {e!r}"
+                raise ProtocolError(arg, e) from e
+
             except (HTTPException, OSError) as e:
-                # This includes IncompleteRead.
                 raise ProtocolError(f"Connection broken: {e!r}", e) from e
 
             # If no exception is thrown, we should avoid cleaning up
@@ -622,10 +949,119 @@ class HTTPResponse(BaseHTTPResponse):
             if self._original_response and self._original_response.isclosed():
                 self.release_conn()
 
+    def _fp_read(
+        self,
+        amt: int | None = None,
+        *,
+        read1: bool = False,
+    ) -> bytes:
+        """
+        Read a response with the thought that reading the number of bytes
+        larger than can fit in a 32-bit int at a time via SSL in some
+        known cases leads to an overflow error that has to be prevented
+        if `amt` or `self.length_remaining` indicate that a problem may
+        happen.
+
+        The known cases:
+          * CPython < 3.9.7 because of a bug
+            https://github.com/urllib3/urllib3/issues/2513#issuecomment-1152559900.
+          * urllib3 injected with pyOpenSSL-backed SSL-support.
+          * CPython < 3.10 only when `amt` does not fit 32-bit int.
+        """
+        assert self._fp
+        c_int_max = 2**31 - 1
+        if (
+            (amt and amt > c_int_max)
+            or (
+                amt is None
+                and self.length_remaining
+                and self.length_remaining > c_int_max
+            )
+        ) and (util.IS_PYOPENSSL or sys.version_info < (3, 10)):
+            if read1:
+                return self._fp.read1(c_int_max)
+            buffer = io.BytesIO()
+            # Besides `max_chunk_amt` being a maximum chunk size, it
+            # affects memory overhead of reading a response by this
+            # method in CPython.
+            # `c_int_max` equal to 2 GiB - 1 byte is the actual maximum
+            # chunk size that does not lead to an overflow error, but
+            # 256 MiB is a compromise.
+            max_chunk_amt = 2**28
+            while amt is None or amt != 0:
+                if amt is not None:
+                    chunk_amt = min(amt, max_chunk_amt)
+                    amt -= chunk_amt
+                else:
+                    chunk_amt = max_chunk_amt
+                data = self._fp.read(chunk_amt)
+                if not data:
+                    break
+                buffer.write(data)
+                del data  # to reduce peak memory usage by `max_chunk_amt`.
+            return buffer.getvalue()
+        elif read1:
+            return self._fp.read1(amt) if amt is not None else self._fp.read1()
+        else:
+            # StringIO doesn't like amt=None
+            return self._fp.read(amt) if amt is not None else self._fp.read()
+
+    def _raw_read(
+        self,
+        amt: int | None = None,
+        *,
+        read1: bool = False,
+    ) -> bytes:
+        """
+        Reads `amt` of bytes from the socket.
+        """
+        if self._fp is None:
+            return None  # type: ignore[return-value]
+
+        fp_closed = getattr(self._fp, "closed", False)
+
+        with self._error_catcher():
+            data = self._fp_read(amt, read1=read1) if not fp_closed else b""
+            if amt is not None and amt != 0 and not data:
+                # Platform-specific: Buggy versions of Python.
+                # Close the connection when no data is returned
+                #
+                # This is redundant to what httplib/http.client _should_
+                # already do.  However, versions of python released before
+                # December 15, 2012 (http://bugs.python.org/issue16298) do
+                # not properly close the connection in all cases. There is
+                # no harm in redundantly calling close.
+                self._fp.close()
+                if (
+                    self.enforce_content_length
+                    and self.length_remaining is not None
+                    and self.length_remaining != 0
+                ):
+                    # This is an edge case that httplib failed to cover due
+                    # to concerns of backward compatibility. We're
+                    # addressing it here to make sure IncompleteRead is
+                    # raised during streaming, so all calls with incorrect
+                    # Content-Length are caught.
+                    raise IncompleteRead(self._fp_bytes_read, self.length_remaining)
+            elif read1 and (
+                (amt != 0 and not data) or self.length_remaining == len(data)
+            ):
+                # All data has been read, but `self._fp.read1` in
+                # CPython 3.12 and older doesn't always close
+                # `http.client.HTTPResponse`, so we close it here.
+                # See https://github.com/python/cpython/issues/113199
+                self._fp.close()
+
+        if data:
+            self._fp_bytes_read += len(data)
+            if self.length_remaining is not None:
+                self.length_remaining -= len(data)
+        return data
+
     def read(
         self,
-        amt: Optional[int] = None,
-        decode_content: Optional[bool] = None,
+        amt: int | None = None,
+        decode_content: bool | None = None,
         cache_content: bool = False,
     ) -> bytes:
         """
@@ -652,59 +1088,145 @@ class HTTPResponse(BaseHTTPResponse):
         if decode_content is None:
             decode_content = self.decode_content
 
-        if self._fp is None:
-            return None  # type: ignore[return-value]
+        if amt and amt < 0:
+            # Negative numbers and `None` should be treated the same.
+            amt = None
+        elif amt is not None:
+            cache_content = False
 
-        flush_decoder = False
-        fp_closed = getattr(self._fp, "closed", False)
+            if self._decoder and self._decoder.has_unconsumed_tail:
+                decoded_data = self._decode(
+                    b"",
+                    decode_content,
+                    flush_decoder=False,
+                    max_length=amt - len(self._decoded_buffer),
+                )
+                self._decoded_buffer.put(decoded_data)
+            if len(self._decoded_buffer) >= amt:
+                return self._decoded_buffer.get(amt)
 
-        with self._error_catcher():
-            if amt is None:
-                # cStringIO doesn't like amt=None
-                data = self._fp.read() if not fp_closed else b""
-                flush_decoder = True
-            else:
-                cache_content = False
-                data = self._fp.read(amt) if not fp_closed else b""
-                if (
-                    amt != 0 and not data
-                ):  # Platform-specific: Buggy versions of Python.
-                    # Close the connection when no data is returned
-                    #
-                    # This is redundant to what httplib/http.client _should_
-                    # already do.  However, versions of python released before
-                    # December 15, 2012 (http://bugs.python.org/issue16298) do
-                    # not properly close the connection in all cases. There is
-                    # no harm in redundantly calling close.
-                    self._fp.close()
-                    flush_decoder = True
-                    if (
-                        self.enforce_content_length
-                        and self.length_remaining is not None
-                        and self.length_remaining != 0
-                    ):
-                        # This is an edge case that httplib failed to cover due
-                        # to concerns of backward compatibility. We're
-                        # addressing it here to make sure IncompleteRead is
-                        # raised during streaming, so all calls with incorrect
-                        # Content-Length are caught.
-                        raise IncompleteRead(self._fp_bytes_read, self.length_remaining)
+        data = self._raw_read(amt)
 
-        if data:
-            self._fp_bytes_read += len(data)
-            if self.length_remaining is not None:
-                self.length_remaining -= len(data)
+        flush_decoder = amt is None or (amt != 0 and not data)
 
+        if (
+            not data
+            and len(self._decoded_buffer) == 0
+            and not (self._decoder and self._decoder.has_unconsumed_tail)
+        ):
+            return data
+
+        if amt is None:
             data = self._decode(data, decode_content, flush_decoder)
-
             if cache_content:
                 self._body = data
+        else:
+            # do not waste memory on buffer when not decoding
+            if not decode_content:
+                if self._has_decoded_content:
+                    raise RuntimeError(
+                        "Calling read(decode_content=False) is not supported after "
+                        "read(decode_content=True) was called."
+                    )
+                return data
+
+            decoded_data = self._decode(
+                data,
+                decode_content,
+                flush_decoder,
+                max_length=amt - len(self._decoded_buffer),
+            )
+            self._decoded_buffer.put(decoded_data)
+
+            while len(self._decoded_buffer) < amt and data:
+                # TODO make sure to initially read enough data to get past the headers
+                # For example, the GZ file header takes 10 bytes, we don't want to read
+                # it one byte at a time
+                data = self._raw_read(amt)
+                decoded_data = self._decode(
+                    data,
+                    decode_content,
+                    flush_decoder,
+                    max_length=amt - len(self._decoded_buffer),
+                )
+                self._decoded_buffer.put(decoded_data)
+            data = self._decoded_buffer.get(amt)
 
         return data
 
+    def read1(
+        self,
+        amt: int | None = None,
+        decode_content: bool | None = None,
+    ) -> bytes:
+        """
+        Similar to ``http.client.HTTPResponse.read1`` and documented
+        in :meth:`io.BufferedReader.read1`, but with an additional parameter:
+        ``decode_content``.
+
+        :param amt:
+            How much of the content to read.
+
+        :param decode_content:
+            If True, will attempt to decode the body based on the
+            'content-encoding' header.
+        """
+        if decode_content is None:
+            decode_content = self.decode_content
+        if amt and amt < 0:
+            # Negative numbers and `None` should be treated the same.
+            amt = None
+        # try and respond without going to the network
+        if self._has_decoded_content:
+            if not decode_content:
+                raise RuntimeError(
+                    "Calling read1(decode_content=False) is not supported after "
+                    "read1(decode_content=True) was called."
+                )
+            if (
+                self._decoder
+                and self._decoder.has_unconsumed_tail
+                and (amt is None or len(self._decoded_buffer) < amt)
+            ):
+                decoded_data = self._decode(
+                    b"",
+                    decode_content,
+                    flush_decoder=False,
+                    max_length=(
+                        amt - len(self._decoded_buffer) if amt is not None else None
+                    ),
+                )
+                self._decoded_buffer.put(decoded_data)
+            if len(self._decoded_buffer) > 0:
+                if amt is None:
+                    return self._decoded_buffer.get_all()
+                return self._decoded_buffer.get(amt)
+        if amt == 0:
+            return b""
+
+        # FIXME, this method's type doesn't say returning None is possible
+        data = self._raw_read(amt, read1=True)
+        if not decode_content or data is None:
+            return data
+
+        self._init_decoder()
+        while True:
+            flush_decoder = not data
+            decoded_data = self._decode(
+                data, decode_content, flush_decoder, max_length=amt
+            )
+            self._decoded_buffer.put(decoded_data)
+            if decoded_data or flush_decoder:
+                break
+            data = self._raw_read(8192, read1=True)
+
+        if amt is None:
+            return self._decoded_buffer.get_all()
+        return self._decoded_buffer.get(amt)
+
     def stream(
-        self, amt: Optional[int] = 2 ** 16, decode_content: Optional[bool] = None
-    ) -> Generator[bytes, None, None]:
+        self, amt: int | None = 2**16, decode_content: bool | None = None
+    ) -> typing.Generator[bytes]:
         """
         A generator wrapper for the read() method. A call will block until
         ``amt`` bytes have been read from the connection or until the
@@ -723,41 +1245,32 @@ class HTTPResponse(BaseHTTPResponse):
         if self.chunked and self.supports_chunked_reads():
             yield from self.read_chunked(amt, decode_content=decode_content)
         else:
-            while not is_fp_closed(self._fp):
+            while (
+                not is_fp_closed(self._fp)
+                or len(self._decoded_buffer) > 0
+                or (self._decoder and self._decoder.has_unconsumed_tail)
+            ):
                 data = self.read(amt=amt, decode_content=decode_content)
 
                 if data:
                     yield data
 
-    @classmethod
-    def from_httplib(
-        ResponseCls: Type["HTTPResponse"], r: _HttplibHTTPResponse, **response_kw: Any
-    ) -> "HTTPResponse":
-        """
-        Given an :class:`http.client.HTTPResponse` instance ``r``, return a
-        corresponding :class:`urllib3.response.HTTPResponse` object.
-
-        Remaining parameters are passed to the HTTPResponse constructor, along
-        with ``original_response=r``.
-        """
-        headers = r.msg
-
-        if not isinstance(headers, HTTPHeaderDict):
-            headers = HTTPHeaderDict(headers.items())  # type: ignore[assignment]
-
-        resp = ResponseCls(
-            body=r,
-            headers=headers,  # type: ignore[arg-type]
-            status=r.status,
-            version=r.version,
-            reason=r.reason,
-            original_response=r,
-            **response_kw,
-        )
-        return resp
-
     # Overrides from io.IOBase
+    def readable(self) -> bool:
+        return True
+
+    def shutdown(self) -> None:
+        if not self._sock_shutdown:
+            raise ValueError("Cannot shutdown socket as self._sock_shutdown is not set")
+        if self._connection is None:
+            raise RuntimeError(
+                "Cannot shutdown as connection has already been released to the pool"
+            )
+        self._sock_shutdown(socket.SHUT_RD)
+
     def close(self) -> None:
+        self._sock_shutdown = None
+
         if not self.closed and self._fp:
             self._fp.close()
 
@@ -770,7 +1283,7 @@ class HTTPResponse(BaseHTTPResponse):
     @property
     def closed(self) -> bool:
         if not self.auto_close:
-            return io.IOBase.closed.__get__(self)  # type: ignore[no-any-return, attr-defined]
+            return io.IOBase.closed.__get__(self)  # type: ignore[no-any-return]
         elif self._fp is None:
             return True
         elif hasattr(self._fp, "isclosed"):
@@ -818,11 +1331,15 @@ class HTTPResponse(BaseHTTPResponse):
         try:
             self.chunk_left = int(line, 16)
         except ValueError:
-            # Invalid chunked protocol response, abort.
             self.close()
-            raise InvalidChunkLength(self, line) from None
+            if line:
+                # Invalid chunked protocol response, abort.
+                raise InvalidChunkLength(self, line) from None
+            else:
+                # Truncated at start of next chunk
+                raise ProtocolError("Response ended prematurely") from None
 
-    def _handle_chunk(self, amt: Optional[int]) -> bytes:
+    def _handle_chunk(self, amt: int | None) -> bytes:
         returned_chunk = None
         if amt is None:
             chunk = self._fp._safe_read(self.chunk_left)  # type: ignore[union-attr]
@@ -845,8 +1362,8 @@ class HTTPResponse(BaseHTTPResponse):
         return returned_chunk  # type: ignore[no-any-return]
 
     def read_chunked(
-        self, amt: Optional[int] = None, decode_content: Optional[bool] = None
-    ) -> Generator[bytes, None, None]:
+        self, amt: int | None = None, decode_content: bool | None = None
+    ) -> typing.Generator[bytes]:
         """
         Similar to :meth:`HTTPResponse.read`, but with an additional
         parameter: ``decode_content``.
@@ -884,13 +1401,25 @@ class HTTPResponse(BaseHTTPResponse):
             if self._fp.fp is None:  # type: ignore[union-attr]
                 return None
 
+            if amt and amt < 0:
+                # Negative numbers and `None` should be treated the same,
+                # but httplib handles only `None` correctly.
+                amt = None
+
             while True:
-                self._update_chunk_length()
-                if self.chunk_left == 0:
-                    break
-                chunk = self._handle_chunk(amt)
+                # First, check if any data is left in the decoder's buffer.
+                if self._decoder and self._decoder.has_unconsumed_tail:
+                    chunk = b""
+                else:
+                    self._update_chunk_length()
+                    if self.chunk_left == 0:
+                        break
+                    chunk = self._handle_chunk(amt)
                 decoded = self._decode(
-                    chunk, decode_content=decode_content, flush_decoder=False
+                    chunk,
+                    decode_content=decode_content,
+                    flush_decoder=False,
+                    max_length=amt,
                 )
                 if decoded:
                     yield decoded
@@ -917,7 +1446,7 @@ class HTTPResponse(BaseHTTPResponse):
                 self._original_response.close()
 
     @property
-    def url(self) -> Optional[str]:
+    def url(self) -> str | None:
         """
         Returns the URL that was the source of this response.
         If the request that generated this response redirected, this method
@@ -926,11 +1455,11 @@ class HTTPResponse(BaseHTTPResponse):
         return self._request_url
 
     @url.setter
-    def url(self, url: str) -> None:
+    def url(self, url: str | None) -> None:
         self._request_url = url
 
-    def __iter__(self) -> Iterator[bytes]:
-        buffer: List[bytes] = []
+    def __iter__(self) -> typing.Iterator[bytes]:
+        buffer: list[bytes] = []
         for chunk in self.stream(decode_content=True):
             if b"\n" in chunk:
                 chunks = chunk.split(b"\n")

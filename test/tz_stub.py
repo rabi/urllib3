@@ -1,20 +1,17 @@
+from __future__ import annotations
+
 import datetime
 import os
 import time
+import typing
+import zoneinfo
 from contextlib import contextmanager
-from typing import Generator, Optional
 
 import pytest
 
-try:
-    import zoneinfo  # type: ignore[import]
-except ImportError:
-    # Python < 3.9
-    from backports import zoneinfo  # type: ignore[no-redef]
-
 
 @contextmanager
-def stub_timezone_ctx(tzname: Optional[str]) -> Generator[None, None, None]:
+def stub_timezone_ctx(tzname: str | None) -> typing.Generator[None]:
     """
     Switch to a locally-known timezone specified by `tzname`.
     On exit, restore the previous timezone.

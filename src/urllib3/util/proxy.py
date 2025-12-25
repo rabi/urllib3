@@ -1,18 +1,17 @@
-from typing import TYPE_CHECKING, Optional, Union
+from __future__ import annotations
 
-from .ssl_ import create_urllib3_context, resolve_cert_reqs, resolve_ssl_version
+import typing
+
 from .url import Url
 
-if TYPE_CHECKING:
-    import ssl
-
+if typing.TYPE_CHECKING:
     from ..connection import ProxyConfig
 
 
 def connection_requires_http_tunnel(
-    proxy_url: Optional[Url] = None,
-    proxy_config: "Optional[ProxyConfig]" = None,
-    destination_scheme: Optional[str] = None,
+    proxy_url: Url | None = None,
+    proxy_config: ProxyConfig | None = None,
+    destination_scheme: str | None = None,
 ) -> bool:
     """
     Returns True if the connection requires an HTTP CONNECT through the proxy.
@@ -42,29 +41,3 @@ def connection_requires_http_tunnel(
 
     # Otherwise always use a tunnel.
     return True
-
-
-def create_proxy_ssl_context(
-    ssl_version: Optional[Union[int, str]] = None,
-    cert_reqs: Optional[Union[int, str]] = None,
-    ca_certs: Optional[str] = None,
-    ca_cert_dir: Optional[str] = None,
-    ca_cert_data: Union[None, str, bytes] = None,
-) -> "ssl.SSLContext":
-    """
-    Generates a default proxy ssl context if one hasn't been provided by the
-    user.
-    """
-    ssl_context = create_urllib3_context(
-        ssl_version=resolve_ssl_version(ssl_version),
-        cert_reqs=resolve_cert_reqs(cert_reqs),
-    )
-    if (
-        not ca_certs
-        and not ca_cert_dir
-        and not ca_cert_data
-        and hasattr(ssl_context, "load_default_certs")
-    ):
-        ssl_context.load_default_certs()
-
-    return ssl_context
